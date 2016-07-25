@@ -1,0 +1,100 @@
+#!/bin/bash -eu
+set -o pipefail
+
+OVH_API="${OVH_API:-https://api.ovh.com/1.0}"
+DEBUG=${DEBUG:-0}
+
+man() {
+  cat <<EOF
+
+Usage: ovshapi METHOD PATH
+
+  METHOD    GET, POST, PUT or DELETE
+  PATH      The URL path
+
+On POST, the request body is provided via stdin.
+
+The three environment variables OVH_AK, OVH_AK and OVH_CK must be set.
+Visit $OVH_API/createApp/ to create it.
+If OVH_CK is not given, URL is generated to validate a new one.
+
+EOF
+}
+
+[ -n "${1:-}" ] && METHOD="${1}" || man "Missing method (GET|POST|...)"
+[ -n "${2:-}" ] && QUERY="${2}" || man "Missing PATH like /ip?type=failover"
+[ -z $OVH_AK ] && man 'Missing Application Key (use export OVH_AK=....)'
+[ -z $OVH_AS ] && man 'Missing Application Secret (use export OVH_AS=....)'
+
+# Take body from stdin
+[ -t 0 ] && BODY="" || BODY=$(cat | jq -c .)
+
+CURL=$(which curl)
+[ -x $CURL ] || end 1 "Missing curl binary"
+
+JQ=$(which jq)
+[ -x $JQ ] && JQ="$JQ --raw-output" || JG=''
+JQ=''
+
+# Time delta
+date1=$(date +%s)
+date2=$($CURL -s $OVH_API/auth/time)
+DELTA=$(($date1 - $date2))
+
+OVH_CK=${OVH_CK:-""}
+if [ -z $OVH_CK ]
+then
+  AUTH=$($CURL -s -XPOST -H"X-Ovh-Application: $OVH_AK" -H "Content-type: application/json" \
+         $OVH_API/auth/credential  \
+         -d '{ "accessRules": [ { "method": "GET", "path": "/*" }, { "method": "PUT", "path": "/*" }, { "method": "POST", "path": "/*" }, { "method": "DELETE", "path": "/*" } ] }')
+  if [ -n "${JQ:-}" ]
+  then
+    OVH_CK=$(echo $AUTH | $JQ .consumerKey)
+    URL=$(echo $AUTH | $JQ .validationUrl)
+    echo "Please visit $URL to validate this Consumer Key."
+    echo "After you can export this Consumer Key with: export OVH_CK=$OVH_CK"
+  else
+    echo $AUTH
+    echo
+    echo "Please visit the validationUrl and export the Consumer Key."
+  fi
+  exit
+fi
+
+QUERY="$OVH_API$QUERY"
+TSTAMP=$(($(date +%s) + $DELTA))
+
+PRE=$OVH_AS"+"$OVH_CK"+"$METHOD"+"$QUERY"+"$BODY"+"$TSTAMP
+SIGNATURE='$1$'$(echo -n $PRE | openssl dgst -sha1 -hex | cut -f 2 -d ' ' )
+
+[ $DEBUG -eq 1 ] && set -x
+
+call() {
+  $CURL -s \
+    -X$METHOD                           \
+    -H "Content-type: application/json" \
+    -H "X-Ovh-Application:$OVH_AK"      \
+    -H "X-Ovh-Timestamp:$TSTAMP"        \
+    -H "X-Ovh-Signature:$SIGNATURE"     \
+    -H "X-Ovh-Consumer:$OVH_CK"         \
+    -d "$BODY" \
+    $QUERY \
+      -w '\n{"code":"%{http_code}","time":"%{time_total}"}\n'
+}
+
+>&2 echo -n "--> $METHOD $QUERY "
+
+response=$(call)
+status=$(echo "$response" | tail -1)
+code=$(jq -r .code <<< $status)
+duration=$(jq -r .time <<< $status)
+
+>&2 echo "$code in ${duration}s"
+
+if [[ "$code" != "200" ]]; then
+  >&2 echo -e "\033[31mERROR:\033[m: $code on $1 $2"
+  echo "$response" | head -n -1
+  exit 1
+fi
+
+echo "$response" | head -n -1 | jq -c .
