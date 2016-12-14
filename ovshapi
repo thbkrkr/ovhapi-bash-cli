@@ -93,8 +93,8 @@ duration=$(jq -r .time <<< $status)
 
 if [[ "$code" != "200" ]]; then
   >&2 echo -e "\033[31mERROR:\033[m: $code on $1 $2"
-  echo "$response" | head -n -1
+  echo "$response" | head -n 1
   exit 1
 fi
 
-echo "$response" | head -n -1 | jq -c .
+echo "$response" | head -n 1 | jq -c .
